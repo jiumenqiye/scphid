@@ -6,6 +6,14 @@ import time
 import threading
 import queue
 import random
+import subprocess
+from io import BytesIO
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
 
 # --- 核心配置 ---
 BAUD_RATE = 2000000           
@@ -114,17 +122,90 @@ class SmoothGroupApp:
 
         self.root = tk.Tk()
         self.root.title(f"同步控制中心 (稳定版) - {len(self.workers)}台")
+        self.screen_running = True
+        self.screen_image_ref = None
+        self.screen_item_id = None
+        self.screen_status_var = tk.StringVar(value="[投屏] 未启动")
+        self.screen_device_id = self._get_first_adb_device()
         
         self.canvas = tk.Canvas(self.root, width=int(REAL_W*DISPLAY_SCALE), 
                                height=int(REAL_H*DISPLAY_SCALE), bg="#1a1a1a")
         self.canvas.pack(pady=10)
 
+        tk.Label(self.root, textvariable=self.screen_status_var, fg="#39ff14", bg="#101010").pack(fill="x")
+
+        self._start_screen_mirror()
+
         self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
         print(f"\n[SYS] 所有通道就绪，黑框内操作即可同步\n" + "-"*40)
         self.root.mainloop()
+
+    def _get_first_adb_device(self):
+        try:
+            out = subprocess.check_output(["adb", "devices"], text=True, stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            self.screen_status_var.set("[投屏] adb 未安装，跳过投屏")
+            return None
+        except Exception as e:
+            self.screen_status_var.set(f"[投屏] adb 检查失败: {e}")
+            return None
+
+        for line in out.splitlines()[1:]:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                return parts[0]
+
+        self.screen_status_var.set("[投屏] 未发现在线 Android 设备")
+        return None
+
+    def _start_screen_mirror(self):
+        if not self.screen_device_id:
+            return
+        if Image is None or ImageTk is None:
+            self.screen_status_var.set("[投屏] 缺少 Pillow，无法显示画面")
+            return
+
+        self.screen_status_var.set(f"[投屏] 已连接设备: {self.screen_device_id}")
+        threading.Thread(target=self._screen_loop, daemon=True).start()
+
+    def _screen_loop(self):
+        while self.screen_running:
+            try:
+                png_data = subprocess.check_output(
+                    ["adb", "-s", self.screen_device_id, "exec-out", "screencap", "-p"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.8,
+                )
+                image = Image.open(BytesIO(png_data)).convert("RGB")
+                image = image.resize((int(REAL_W * DISPLAY_SCALE), int(REAL_H * DISPLAY_SCALE)))
+                tk_img = ImageTk.PhotoImage(image)
+                self.root.after(0, self._update_canvas_bg, tk_img)
+            except Exception:
+                self.root.after(0, self.screen_status_var.set, "[投屏] 抓帧失败，正在重试...")
+                time.sleep(1)
+                continue
+            time.sleep(0.35)
+
+    def _update_canvas_bg(self, tk_img):
+        self.screen_image_ref = tk_img
+        if self.screen_item_id is None:
+            self.screen_item_id = self.canvas.create_image(0, 0, anchor="nw", image=tk_img)
+            self.canvas.tag_lower(self.screen_item_id)
+        else:
+            self.canvas.itemconfig(self.screen_item_id, image=tk_img)
+        self.screen_status_var.set(f"[投屏] 正在显示设备: {self.screen_device_id}")
+
+    def on_close(self):
+        self.screen_running = False
+        self.root.destroy()
 
     def _pack_data(self, action_type, x, y):
         rx = max(0, min(REAL_W, int(x / DISPLAY_SCALE)))
